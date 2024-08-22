@@ -1,0 +1,215 @@
+import TDS_Sim  # Importing the TDS_Sim module for simulating TDS curves
+import numpy as np  # Importing numpy for numerical operations
+import random  # Importing random for generating random numbers
+import matplotlib.pyplot as plt  # Importing matplotlib for plotting
+import joblib  # Importing joblib for parallel processing
+from sklearn.model_selection import train_test_split  # For splitting data into training and testing sets
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_curve, auc  # Metrics for model evaluation
+from sklearn.preprocessing import label_binarize, StandardScaler  # For preprocessing data
+import seaborn as sns  # For enhanced plotting
+from itertools import cycle  # For cycling through color schemes in plots
+
+# Imports for neural network
+import tensorflow as tf  # TensorFlow framework for building neural networks
+from keras.models import Sequential  # Sequential model from Keras for building neural networks layer by layer
+from keras.layers import Dense, Dropout  # Neural network layers from Keras
+from keras.callbacks import EarlyStopping  # For stopping training early if performance doesn't improve
+
+# STEP 1: GENERATE SYNTHETIC TDS DATA
+NumSamples = 4000  # Number of samples to generate
+n_cpu_cores = 5  # Number of CPU cores to use for parallel processing
+
+def takeSecond(elem):
+    """Helper function to sort based on the second element."""
+    return elem[1]
+
+def GenerateDataPoint(i):
+    """Generates a synthetic data point with random TDS parameters."""
+    PlotWhileSolving = False
+    model = "Rates"
+    NumTraps = random.randint(1, 3)  # Randomly select number of traps
+
+    N_Elements = 10  # Number of finite elements for simulation
+    dT_Step = 120.0  # Time increment in the simulation
+
+    Thickness = 10.0e-3  # Sample thickness in meters
+    Diff_RT = 1.0e-9  # Diffusion rate at room temperature
+    E_diff = 2 * 4.0e3  # Activation energy for diffusion
+
+    k_T = [1.0e4, 1.0e0]  # Boundary absorption-desorption rates
+
+    time_Charge = 12.0 * 3600.0  # Charging time in seconds
+    Temp_Charge = 273.15 + 20.0  # Charging temperature in Kelvin
+    pCharge = 1.0e6  # Hydrogen fugacity during charging
+
+    time_rest = 600.0  # Rest time between charging and TDS in seconds
+    TDS_HeatingRate = 1.0 / 60.0  # Heating rate in Kelvin per second
+    TDS_Time = 3600.0 * 24  # Total TDS time in seconds
+
+    traps = []
+    for t in range(0, NumTraps):
+        validPoint = False
+        while not validPoint:
+            E_abs = 20.0e3  # Absorption energy
+            E_des = random.uniform(40.0e3, 150.0e3)  # Random desorption energy
+            N = random.uniform(30.0, 100.0)  # Random number of trapping sites
+            goodDist = True
+            for E in traps:
+                if abs(E[1] - E_des) < 10e3:
+                    goodDist = False
+            validPoint = goodDist
+        traps.append([E_abs, E_des, N])
+        traps.sort(key=takeSecond)
+
+    N_traps = [t[2] for t in traps]  # Number of traps
+    E_traps = [[t[0], t[1]] for t in traps]  # Energies of traps
+
+    print(f"{i}:")
+    print(f"\t N={N_traps}")
+    print(f"\t E={E_traps}")
+
+    # Creating a sample and simulating TDS
+    Sample = TDS_Sim.TDS_Sample(Thickness, N_Elements, dT_Step, PlotWhileSolving)
+    Sample.Set_Params(model, Diff_RT, E_diff, N_traps, E_traps, k_T)
+    Sample.Charge(time_Charge, Temp_Charge, pCharge)
+    Sample.Rest(time_rest)
+    T, J = Sample.TDS(TDS_Time, TDS_HeatingRate)
+
+    return NumTraps, N_traps, E_traps, T, J
+
+# STEP 2: TRAIN NEURAL NETWORK CLASSIFIER TO PREDICT NUMBER OF TRAPS
+if __name__ == "__main__":
+    random.seed(42)  # Set random seed for reproducibility
+
+    # Generate synthetic TDS data in parallel
+    Res = joblib.Parallel(n_jobs=n_cpu_cores)(joblib.delayed(GenerateDataPoint)(i) for i in range(NumSamples))
+    print(f"Number of samples in Res: {len(Res)}")
+
+    Sample_NTraps = []  # Store number of traps per sample
+    SampleResults = []  # Store TDS results (Temperature and Flux)
+    Sample_E_Traps = []  # Store energies of traps
+
+    for i in range(NumSamples):
+        Sample_NTraps.append(Res[i][0])
+        Sample_E_Traps.append(Res[i][2])
+        SampleResults.append([Res[i][3], Res[i][4]])
+
+    Features = []  # To store features extracted from TDS curves
+    Labels = []  # To store the number of traps as labels
+
+    for i in range(NumSamples):
+        Labels.append(Sample_NTraps[i])  # Append number of traps
+        # Interpolate TDS data to create consistent feature size
+        T = np.interp(np.linspace(0, len(SampleResults[i][0])-1, num=100), np.arange(len(SampleResults[i][0])), SampleResults[i][1])
+        Features.append(T)
+
+    Features = np.array(Features)
+    Labels = np.array(Labels)
+
+    print("Features shape:", Features.shape)
+    print("Labels shape:", Labels.shape)
+
+    # Standardize the features
+    scaler = StandardScaler()
+    Features = scaler.fit_transform(Features)
+
+    # Binarize the labels for neural network training
+    Labels = label_binarize(Labels, classes=[1, 2, 3])
+
+    # Split the data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(Features, Labels, train_size=0.8, test_size=0.2, random_state=42)
+
+    # Define and train a neural network
+    model = Sequential()
+    model.add(Dense(256, activation='relu', input_shape=(X_train.shape[1],)))
+    model.add(Dropout(0.5))
+    model.add(Dense(128, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dense(3, activation='softmax'))  # Output layer for 3 classes
+
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+    # Early stopping to prevent overfitting
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+    # Train the model and store the training history
+    history = model.fit(X_train, y_train, epochs=500, batch_size=2, validation_split=0.2, callbacks=[early_stopping])
+
+    # Predict on the test set
+    y_pred = model.predict(X_test)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    y_test_classes = np.argmax(y_test, axis=1)
+
+    # Evaluate the model's performance
+    accuracy = accuracy_score(y_test_classes, y_pred_classes)
+    report = classification_report(y_test_classes, y_pred_classes)
+    print("Classification Accuracy:", accuracy)
+    print("Classification Report:\n", report)
+
+    # Save the classification report to a file
+    with open("NN_classification_report.txt", "w") as f:
+        f.write(f"Classification Accuracy: {accuracy}\n\n")
+        f.write("Classification Report:\n")
+        f.write(report)
+
+    # Generate confusion matrix
+    cm = confusion_matrix(y_test_classes, y_pred_classes)
+    print("Confusion Matrix:\n", cm)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=[1, 2, 3], yticklabels=[1, 2, 3])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix for Number of Traps Prediction with Neural Network')
+    plt.savefig("NN_Confusion_Matrix.png")
+    plt.show()
+
+    # Plot training and validation accuracy and loss
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='train accuracy')
+    plt.plot(history.history['val_accuracy'], label='val accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend(loc='lower right')
+    plt.title('Training and Validation Accuracy')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='train loss')
+    plt.plot(history.history['val_loss'], label='val loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend(loc='upper right')
+    plt.title('Training and Validation Loss')
+
+    plt.savefig("NN_Training_Loss_and_Accuracy.png")
+    plt.tight_layout()
+    plt.show()
+    
+    # Compute ROC curves and AUC for each class
+    y_prob = model.predict(X_test)
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    for i in range(3):
+        fpr[i], tpr[i], _ = roc_curve(y_test[:, i], y_prob[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    
+    # Plot ROC curves
+    plt.figure()
+    colors = cycle(['aqua', 'darkorange', 'cornflowerblue'])
+    for i, color in zip(range(3), colors):
+        plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                 label='ROC curve of class {0} (area = {1:0.2f})'.format(i + 1, roc_auc[i]))
+
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.savefig("NN_AUC_ROC_Curves.png", dpi=600)
+    plt.show()
